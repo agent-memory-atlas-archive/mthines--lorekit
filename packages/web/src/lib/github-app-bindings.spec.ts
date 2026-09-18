@@ -44,6 +44,38 @@ describe('partitionRepos', () => {
   it('returns empty groups for no repos', () => {
     expect(partitionRepos([], bindings)).toEqual({ bound: [], unbound: [] });
   });
+
+  it('matches a repo covered only by an owner wildcard binding (00111)', () => {
+    const wildcardBindings: BindingsByScope = { 'repo::acme/*': { orgId: 'o2', orgSlug: 'acme-wide' } };
+    const state = partitionRepos([{ full_name: 'acme/anything' }], wildcardBindings);
+    expect(state.bound).toEqual([
+      { fullName: 'acme/anything', scope: 'repo::acme/anything', orgId: 'o2', orgSlug: 'acme-wide' },
+    ]);
+    expect(state.unbound).toHaveLength(0);
+  });
+
+  it('prefers an exact binding over a covering wildcard', () => {
+    const mixed: BindingsByScope = {
+      'repo::acme/*': { orgId: 'o2', orgSlug: 'acme-wide' },
+      'repo::acme/api': { orgId: 'o1', orgSlug: 'acme' },
+    };
+    const state = partitionRepos([{ full_name: 'acme/api' }], mixed);
+    expect(state.bound).toEqual([
+      { fullName: 'acme/api', scope: 'repo::acme/api', orgId: 'o1', orgSlug: 'acme' },
+    ]);
+  });
+
+  it('prefers the longer of two matching wildcard prefixes', () => {
+    const nested: BindingsByScope = {
+      'repo::*': { orgId: 'o1', orgSlug: 'shallow' },
+      'repo::acme/*': { orgId: 'o2', orgSlug: 'deep' },
+    };
+    const state = partitionRepos([{ full_name: 'acme/api' }, { full_name: 'other/thing' }], nested);
+    expect(state.bound).toEqual([
+      { fullName: 'acme/api', scope: 'repo::acme/api', orgId: 'o2', orgSlug: 'deep' },
+      { fullName: 'other/thing', scope: 'repo::other/thing', orgId: 'o1', orgSlug: 'shallow' },
+    ]);
+  });
 });
 
 describe('manageableOrgs', () => {

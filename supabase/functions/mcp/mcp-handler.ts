@@ -4,7 +4,7 @@
  */
 
 import { type AuthContext, getDb, canWrite, canRead, getUserId, keyRestriction } from './auth.ts';
-import { scopeAllowedByKey } from '../_shared/schemas/api-key.ts';
+import { scopeAllowedByKey, KeyScopeDeniedError } from '../_shared/schemas/api-key.ts';
 import { type StorageAdapter } from './storage-adapter.ts';
 import { UserInputError, safeValidateScope, parseMemoryRefs } from '../_shared/scope/scope.ts';
 import { scopeTypeAttribute } from '../_shared/scope/scope-type-attribute.ts';
@@ -20,7 +20,7 @@ import { type Params } from './tools.ts';
 //
 // Only the maps moved. Every decision below — the auth gate, the span bracket,
 // the try/catch, the usage events — stays here and stays hand-written.
-import { MEMORY_TOOLS, ORG_TOOLS, ALL_TOOL_NAMES } from './tool-dispatch.generated.ts';
+import { MEMORY_TOOLS, ORG_TOOLS, RETENTION_TOOLS, ALL_TOOL_NAMES } from './tool-dispatch.generated.ts';
 import { type Span } from '../_shared/telemetry/otel.ts';
 import { LimitError, recordUsageEvent, getUserPlanName } from './limits.ts';
 import { toolRequires } from './permissions.ts';
@@ -147,6 +147,12 @@ export async function handleMcp(req: Request, auth: AuthContext, span: Span, ada
     span.setAttributes({ 'mcp.tool.name': toolName });
 
     const isOrgTool = toolName in ORG_TOOLS;
+    // policy.*/groom.* — the retention family (00093+; previously -32601'd
+    // because gen-surfaces.mjs's dispatch grouping was prefix-only and never
+    // placed them in a map). Dispatched with the SAME (db, args, userId, span)
+    // shape as org tools, but the userId passed is `analyticsUserId` (resolved
+    // below), never `toolUserId` — see the dispatch branch and its comment.
+    const isRetentionTool = toolName in RETENTION_TOOLS;
 
     // Permission gate, now shared by BOTH families. Org tools used to be
     // refused here outright unless the caller held a dashboard JWT, because
@@ -178,12 +184,22 @@ export async function handleMcp(req: Request, auth: AuthContext, span: Span, ada
     // decides what the PERSON may do, so a `lk_rw_*` held by a viewer passes
     // here and is denied there (LK002 → OrgPermissionError → clientError).
 
-    // ── Scope gating: memory tools only ──────────────────────────────────────
+    // ── Scope gating: memory tools only, here ────────────────────────────────
     // Org tools carry no `scope`/`scopes` argument, so the checks below would be
     // inert for them. Skipped EXPLICITLY rather than left to that inertness: a
     // future org tool that happened to take a `scope`-named argument would
     // otherwise start silently obeying a memory-shaped rule.
-    if (!isOrgTool) {
+    //
+    // Retention tools ALSO carry a scope (policy.create/update, groom's inline
+    // conditions, or a policy_id's stored scope) and ARE gated against the key
+    // allowlist — just not HERE. `policy.update`/`policy.delete` and
+    // `groom(policy_id)` only know their scope after a DB fetch, which this
+    // pre-dispatch block cannot do without a round trip, so the retention gate
+    // lives one frame later, IN each handler (`tools.ts`'s `assertScopeAllowed`
+    // calls, thrown as `KeyScopeDeniedError` and caught below). This keeps one
+    // gating code path per surface — inline pre-dispatch for memory, in-handler
+    // for retention — rather than splitting memory tools across both.
+    if (!isOrgTool && !isRetentionTool) {
       // Scope allowlist (migration 00068). Same class of denial as the two
       // above — authenticated, insufficient scope — so the same
       // JSONRPC_FORBIDDEN (HTTP 200), never -32001.
@@ -378,6 +394,21 @@ export async function handleMcp(req: Request, auth: AuthContext, span: Span, ada
         // `p_actor_user_id` and honoured only on a verified service_role
         // connection.
         result = await ORG_TOOLS[toolName as keyof typeof ORG_TOOLS](db, toolArgs, toolUserId, toolSpan);
+      } else if (isRetentionTool) {
+        // policy.*/groom.* tools: (db, args, userId, span, keyScoping) — but
+        // unlike org AND memory tools, the userId passed here is
+        // `analyticsUserId` (the RESOLVED owner), never `toolUserId`. The
+        // underlying lorekit_policy_*/lorekit_groom_* RPCs take `p_user_id`
+        // explicitly and throw a UserInputError on null — there is no
+        // `auth.uid()` fallback the way the org RPCs have. `toolUserId` is
+        // null for every JWT caller, so passing it here would break
+        // policy/groom over MCP for exactly the dashboard-JWT path the REST
+        // `requireUserId(auth)` helper already resolves correctly.
+        // `analyticsUserId` is that same resolved owner for both JWT and
+        // api_key auth. `keyRestriction(auth)` is the same call the memory
+        // family makes below — each retention handler gates the scope it
+        // resolves against it (see `assertScopeAllowed` in `tools.ts`).
+        result = await RETENTION_TOOLS[toolName as keyof typeof RETENTION_TOOLS](db, toolArgs, analyticsUserId, toolSpan, keyRestriction(auth));
       } else {
         // memory.* tools: (db, args, toolUserId, span, keyScoping, correlationId)
         // toolUserId is null for JWT auth — RLS handles scoping on the DB side.
@@ -448,13 +479,22 @@ export async function handleMcp(req: Request, auth: AuthContext, span: Span, ada
       // would inflate the `lorekit.mcp` error rate an operator alerts on.
       // Rate-limit LimitErrors never reach here — they are handled before the
       // tool runs (see `index.ts`).
+      //
+      // `KeyScopeDeniedError` (a retention/groom handler's in-handler scope
+      // gate, thrown after a stored-scope fetch) is ALSO client-caused for
+      // span-marking purposes, but is tracked SEPARATELY from `isClientError`
+      // below: that boolean also selects the in-band `isError` RESPONSE shape,
+      // and a scope denial must stay a protocol-level JSONRPC_FORBIDDEN, the
+      // same authenticated-but-forbidden answer the pre-dispatch memory scope
+      // gate gives — never the in-band shape a tool-originated failure gets.
+      const isKeyScopeDenied = err instanceof KeyScopeDeniedError;
       const isClientError = err instanceof UserInputError
         || err instanceof OrgPermissionError
         || err instanceof UnknownOrgError
         || err instanceof TtlError
         || err instanceof CreatedAtError
         || err instanceof LimitError;
-      if (isClientError) {
+      if (isClientError || isKeyScopeDenied) {
         toolSpan.clientError(msg).end();
         span.clientError(msg);
       } else {
@@ -521,6 +561,15 @@ export async function handleMcp(req: Request, auth: AuthContext, span: Span, ada
       // `core/failure.mjs` already reads it. Two MCP surfaces were answering the
       // same class of failure with two different shapes.
       //
+      // A key-scope denial is checked FIRST and returns a protocol-level
+      // JSONRPC_FORBIDDEN — the same authenticated-but-forbidden shape the
+      // pre-dispatch memory scope gate above already uses, never the in-band
+      // `isError` shape the branch below gives every other client error.
+      if (isKeyScopeDenied) {
+        span.setAttributes({ 'authz.result': 'denied', 'authz.reason': 'key_scope_denied' });
+        return jsonrpcError(id, JSONRPC_FORBIDDEN, (err as Error).message);
+      }
+
       // `isClientError` already computed the "the caller can fix this" set, so
       // this reuses it rather than inventing a second classification. A genuine
       // server fault (a DB outage) is NOT tool-originated in any sense the model

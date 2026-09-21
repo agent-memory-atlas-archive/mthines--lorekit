@@ -134,18 +134,11 @@ pnpm nx fn:dev supabase        # run Edge Functions locally
 
 ### Web Storybook tests (interaction + visual regression)
 
-The `@lorekit/web` dashboard has Storybook 10 (`@storybook/nextjs-vite`) wired to
-Vitest **browser mode** via `@storybook/addon-vitest`. Two story files per
-component, two suites, one browser run — driven by `packages/web/vitest.storybook.config.ts`
-(kept **separate** from `vitest.config.ts` so the node/jsdom `nx test` target
-never boots a browser):
-
-- **Interaction tests** — `*.test.stories.tsx` (the `/Tests` namespace, `tags: ['test']`,
-  `chromatic.disableSnapshot`); their `play` functions run as browser tests.
-- **Visual regression** — every OTHER story (`*.stories.tsx` `Default`/`Playground`)
-  is screenshotted by a Storybook-level `afterEach` in `.storybook/vitest.setup.ts`
-  using Vitest 4's `toMatchScreenshot`. Baselines are committed under
-  `src/**/__screenshots__/**/*-chromium-linux.png`.
+`@lorekit/web` runs Storybook 10 (`@storybook/nextjs-vite`) on Vitest **browser mode**:
+`*.test.stories.tsx` are interaction tests (`/Tests` namespace); every other `*.stories.tsx`
+is screenshotted for visual regression (baselines in `src/**/__screenshots__/**/*-chromium-linux.png`).
+Driven by `packages/web/vitest.storybook.config.ts`, kept separate from `vitest.config.ts` so
+`nx test` never boots a browser.
 
 ```bash
 cd packages/web
@@ -154,43 +147,10 @@ npx vitest run --config vitest.storybook.config.ts --changed=main  # only change
 npx vitest run --config vitest.storybook.config.ts -u              # update baselines
 ```
 
-- Invoke with **`npx`**, not `pnpm exec` / `pnpm run` / `nx run` — those wrap the
-  process and keep the Playwright browser child's stdio open, so the run never
-  returns. An `nx test-storybook` target exists for graph awareness but is not
-  used by any CI gate for this reason.
-- **Playwright is pinned to `1.56.0`** (Chromium build 1194) via a root pnpm
-  override, so local runs and CI render on the same browser build and pixel
-  baselines compare like-for-like. Bumping it requires regenerating baselines
-  (`-u`) on Linux/Chromium.
-- CI runs these in the `web-test` job of `ci.yml`, gated by the `changes.web`
-  path filter and diff-optimized with `vitest --changed <base>` (a
-  one-component edit re-tests one component). It is a browser job, so it is NOT
-  part of the `check` job's `nx affected -t test`.
-
-**MSW-mocked full-page stories.** Page/subtree stories mock the Supabase REST
-(PostgREST) responses with [MSW](https://mswjs.io) so the app's real
-`@tanstack/react-query` hooks resolve against a stable dataset (no SWR — React
-Query is the one data layer). Pieces under `packages/web`: `public/mockServiceWorker.js`
-(committed via `msw init`, served in the deployed build via `staticDirs: ['../public']`
-so hosted stories mock too), `src/mocks/memories.ts` (`memoryHandlers()` + fixtures +
-`FROZEN_NOW`), `src/mocks/decorators.tsx` (`withQueryClient` — retries off/no refetch;
-`withFrozenClock` — pins `Date` so time-relative renders are deterministic;
-`withMemorySidebar` — the `/lore` tree's context), and `.storybook/preview.tsx`
-(`initialize()` + `mswLoader`, injects the public Supabase URL, and collapses `motion`
-animations for stable snapshots — inert for the existing component stories). A story opts
-in via `parameters.msw.handlers`. **Mixed rendering model:** `'use client'` pages story as
-true full pages (`app/(dashboard)/lore/LorePage.stories.tsx` — needs
-`parameters.nextjs.appDirectory: true` for `useRouter`/`useSearchParams`); server-component
-pages can't render in the browser, so story their largest client subtree instead
-(`components/dashboard/DashboardStats.stories.tsx` for the RSC `/overview`), never refactor
-an RSC page to client just to story it. The `/lore` lesson list reads the `listMemories`
-**server action** (gated on `getUser()` → empty in the mocked context), so its results panel
-shows the empty state while the browser-fetched scope tree + heatmap populate.
-- **Storybook deploys as its own Vercel project** via native Git integration (no CI job, no
-  `VERCEL_TOKEN`). `packages/web/vercel.json` is the **dashboard** project (Next.js → `.next`),
-  so the Storybook project uses Root Directory = repo root, Framework Preset = Other, Build
-  Command `pnpm --filter @lorekit/web build-storybook`, Output Directory
-  `packages/web/storybook-static`. Full runbook in [docs/storybook.md](./docs/storybook.md).
+- Invoke with **`npx`**, not `pnpm exec` / `nx run` — those keep the Playwright child's stdio open, so the run never returns.
+- **Playwright is pinned to `1.56.0`** via a root pnpm override so local + CI pixel baselines match; bumping it requires regenerating baselines (`-u`) on Linux/Chromium.
+- CI runs these in the `web-test` job (browser job, gated by `changes.web`) — NOT part of `check`'s `nx affected -t test`.
+- Full-page stories mock Supabase REST with **MSW** so real React Query hooks resolve against a stable dataset; server-component pages story their largest client subtree, never refactored to client. Storybook deploys as its OWN Vercel project. Full runbook + MSW / mixed-rendering / deploy detail: [docs/storybook.md](./docs/storybook.md).
 
 ---
 
@@ -247,94 +207,18 @@ The script discovers all skills (any directory under `skills/` containing a `SKI
 agents (`agents/*.md`), and creates a two-tier symlink chain so they are available as native Claude
 skills and sub-agents. It repairs broken links and skips already-correct ones.
 
-### Step 1 — Run `/polish` and auto-fix all findings
+### The five steps
 
-Before opening the PR, run the `polish` skill against the branch. This is a **local-only** pass —
-it never writes to GitHub. All auto-fixable findings must be committed before opening the PR.
+Each step's full procedure lives in its own skill (`polish`, `create-pr`, `review-loop`,
+`implement-suggestion`, `ci-auto-fix`) — the summary table below is the contract. Non-obvious constraints:
 
-Dispatch a sub-agent (subagent_type: general):
+1. **`/polish`** — local-only (never writes to GitHub); auto-fix all findings, commit each pass. Skip only if the diff is non-code.
+2. **`/create-pr`** — opens a **draft**. Do NOT pass `--no-review` (this repo has no external bot; the review pass is `/create-pr`'s own `review-loop`), `--no-feedback` (skips Step 4), or `--no-quality` (skips Steps 3–4).
+3. **`review-loop`** — the ONE reviewer; `/create-pr` auto-runs `Skill("review-loop", "<pr-url> --no-ci")`, converging `pr-reviewer` → `implement-suggestion --resolve-all` → `polish simplify` (≤5 iters) until every thread is resolved by a fix or an honest reply, then refreshes the PR description. Re-run it yourself after any hand-pushed commit.
+4. **`/implement-suggestion --watch`** — background; absorbs genuine external (CodeRabbit/human) feedback posted after `review-loop`'s last push, one commit per comment (`/critical`+`/confidence` gated), ≤5 iters. Never undrafts.
+5. **`/ci-auto-fix`** — drive CI green (confidence-gated, never weakens a check); re-run Step 3 after its push.
 
-> Read /tmp/workspace/agent-skills/skills/quality/polish/SKILL.md and follow it exactly.
-> Run in full mode (default). Auto-fix all simple findings. Apply all Class M mechanical refactors
-> that pass the confidence gate. Commit each pass separately. Do NOT write to GitHub.
-
-Wait for the polish run to finish before proceeding. Planned-complex items (Class J, judgment-required)
-are surfaced for awareness but do not block the workflow — they require a human decision.
-
-Skip this step only if the branch diff is non-code only (docs, lockfiles, generated artefacts).
-
-### Step 2 — Open the PR with `/create-pr` (as a draft)
-
-Open the PR with `/create-pr` (it opens as a **draft** — the draft state is what lets `review-loop`'s
-`pr-reviewer` pass post inline comments while the branch converges).
-
-**Do not pass `--no-review`.** This repo has no external review bot, so the review pass is
-`/create-pr`'s own built-in `review-loop` — dropping it would leave the PR unreviewed. By default
-(no quality flags) `/create-pr`'s Step 6.5 runs `Skill("review-loop", "<pr-url> --no-ci")` for you
-immediately after opening the PR (Step 3 below covers what that does). Do **not** pass `--no-feedback`
-(that skips Step 4) or `--no-quality` (that skips Step 3 and Step 4 both). Undrafting is the last,
-human step, after the flow reaches ready-to-review.
-
-### Step 3 — `review-loop` converges the PR (the ONE review agent on the PR)
-
-`review-loop` is the sole reviewer here — there is no external bot to defer to. `/create-pr`'s Step 6.5
-invokes it automatically as `Skill("review-loop", "<pr-url> --no-ci")`: up to 5 iterations of
-`pr-reviewer` (dispatched fresh each round, read-only, posts one `COMMENT` review, and **re-reviews on
-every new push**, marking its own addressed findings resolved) → `implement-suggestion --resolve-all`
-(applies actionable findings, and replies-to-and-resolves the non-fix threads it can honestly close) →
-`polish simplify` (Class M mechanical refactors) — converging until **every review thread is resolved**,
-either by a fix or an honest reply. The only threads left open at exit are genuine human-judgment flags
-the loop will neither auto-apply nor honestly decline. On convergence it also refreshes the PR
-description to match the shipped diff — do not re-edit the body yourself afterward.
-
-You do NOT need to trigger this manually if you opened the PR with `/create-pr` (Step 2) — it is
-already running. If you push a follow-up commit by hand afterward, re-run it yourself:
-
-```
-Skill("review-loop", "<pr-url> --no-ci")
-```
-
-(`--no-ci` because Step 5 below owns driving CI green; `review-loop` would otherwise also try.)
-
-### Step 4 — Absorb genuine external feedback with `/implement-suggestion --watch`
-
-This step exists for **real** external parties — CodeRabbit, a human reviewer — not a self-review
-duplicate. `/create-pr` dispatches it automatically once `review-loop` converges (its Step 6.7,
-external-bot feedback step) as a **background** sub-agent — so if you opened the PR with `/create-pr`
-(Step 2) it is already running. It is scoped to comments posted **after** `review-loop`'s last push, so
-it never re-applies `review-loop`'s own findings. If you need to drive it yourself, dispatch a
-background sub-agent (`run_in_background: true`, subagent_type: general):
-
-> Invoke: Skill('implement-suggestion', '<pr-url> --watch')
-> Absorb any CodeRabbit / human review feedback to completion. It never opens a new PR and never
-> undrafts this one. Return its per-iteration watch report.
-
-`--watch` waits for each external review, applies the actionable comments (**one commit per comment**,
-each gated by `/critical` then `/confidence`), pushes, and repeats — **bounded to 5 iterations**
-(`--max-iters` default; hard cap 10), processing only comments newer than the last round so it never
-re-applies one. It **never undrafts**.
-
-### Step 5 — Drive CI green; ready-to-review = `review-loop` converged + green CI
-
-`/create-pr` watches CI and delegates mechanical failures to `/ci-auto-fix` for you. For any red check
-on a hand-pushed commit, run it yourself:
-
-```
-/ci-auto-fix
-```
-
-This uses the `ci-auto-fix` skill (wired in during Prerequisites), diagnoses any failing GitHub
-Actions checks, applies a minimal targeted fix, and iterates until all checks are green. The skill
-is confidence-gated (>=90 auto-apply, 80-89 ask, <80 escalate) and will never disable or weaken a
-check. Skip only when CI is already fully green. A `/ci-auto-fix` push is itself a new commit, so if
-you're driving this by hand, re-run Step 3's `Skill("review-loop", "<pr-url> --no-ci")` afterward to
-re-verify against the new head — `/create-pr`'s own run of Steps 6.5/6.7/7–9 already sequences this for
-you end to end.
-
-**Definition of ready-to-review:** `review-loop`'s final `pr-reviewer` verdict is PASS with zero open
-threads (only genuine human-judgment flags may remain, and those must be surfaced to the user) **and**
-every CI check is green. That is the *content* state this flow drives to; the agent does **not** flip
-the draft flag — undrafting stays a human/explicit decision.
+**Definition of ready-to-review:** `review-loop` PASS with zero open threads (only genuine human-judgment flags may remain — surface them) AND green CI. The agent does **not** flip the draft flag — undrafting stays a human decision.
 
 ### Summary table
 
@@ -496,70 +380,69 @@ placeholder for the MCP server URL.
 Each decision's full rationale lives in [`docs/decisions.md`](./docs/decisions.md) —
 the headline here is the rule; follow the link for the "why". Short entries carry
 their rationale inline. **Do not relitigate these.**
-
-- **Dashboard is a CLIENT of LoreKit's REST API** — memory reads/writes go through the `memories` edge function (user JWT), never a direct PostgREST/supabase-js query; every new data surface becomes part of the PUBLIC contract (schema + handler + OpenAPI + `migrations.test.sql`). [rationale](./docs/decisions.md#dashboard-is-a-client-of-lorekits-rest-api)
-- **MCP server endpoint is a static production URL** — always write `https://pqokxlhvnosogizsjztg.supabase.co/functions/v1/mcp` in user-facing content, never a `<ref>` / `<project-ref>` placeholder. [rationale](./docs/decisions.md#mcp-server-endpoint-is-a-static-production-url)
-- **Lore Explorer filters through ONE two-level command menu + pills** — never one picker per dimension, never client-side narrowing; OR within a dimension, AND across; all dimensions filtered server-side; facets are their own drill-down query. 00110: under `tags_mode='all'` a candidate label's count is WITHIN-GROUP CO-OCCURRENCE (rows satisfying every other filter + all selected tags + the candidate); `tags_mode='any'` and scalar dimensions stay self-exclusion. Facet enumeration is STABLE (cross-join-then-filter, so a zero-match value reports `count: 0` and stays listed). [rationale](./docs/decisions.md#lore-explorer-filters-through-one-two-level-command-menu)
-- **The Explorer's Activity panel has a DISPLAY default (24h), separate from the list's (all time)** — substituted for an absent `?range=`, never written back; `RangePicker` emits `{preset:'all'}` (not `null`) so "chose All" and "has not chosen" stay two values. [rationale](./docs/decisions.md#the-explorers-activity-panel-has-a-display-default-separate-from-the-lists)
-- **The Explorer's Activity panel shows ONE body at a time and remembers your disclosure** — a `SegmentedControl` (Stat charts / Heatmap); the expanded heatmap view is the calendar ALONE (no stat grid), collapsed keeps the four numbers. Opens EXPANDED; disclosure + view persist to `localStorage` via `useSyncExternalStore` (`null` = "not yet consulted", render COLLAPSED while unresolved). Never move these to the URL; never re-seed from a `useState` initializer. [rationale](./docs/decisions.md#the-activity-panel-shows-one-body-at-a-time-and-remembers-your-disclosure)
-- **Chart bucket readouts are PORTALED, one per chart** — `AnchoredTooltip` reuses `Tooltip`'s pure `computeTooltipPosition` and takes an `anchor: Element`, because an in-flow panel is clipped by `CollapsibleStatCard`'s `overflow:hidden` reveal region and one `Tooltip` per bucket would be 364 portals. The heatmap's native `title` is gone; its `aria-label` is not. [rationale](./docs/decisions.md#chart-bucket-readouts-are-portaled-and-there-is-one-per-chart)
-- **Dashboard figures COUNT to a new value** (`AnimatedNumber`) — a change indicator, not decoration; two nodes (visible + `sr-only`), so read the `.sr-only` half, never `textContent`; honours `MotionConfig reducedMotion="always"` on top of the device preference, which is what makes the visual baselines deterministic. The `TrendChip` delta uses the same two-node pattern, but ONLY when it abbreviates a large percentage (`+8.8K%`). [rationale](./docs/decisions.md#dashboard-figures-count-to-a-new-value)
-- **Mobile transient selection surfaces use the `BottomSheet` primitive** — never an anchored popover on the phone breakpoint; share ONE body between desktop popover and sheet (`FilterMenu` is the reference). [rationale](./docs/decisions.md#mobile-transient-selection-surfaces-use-the-bottomsheet-primitive)
+- **Dashboard is a CLIENT of LoreKit's REST API** — [rationale](./docs/decisions.md#dashboard-is-a-client-of-lorekits-rest-api)
+- **MCP server endpoint is a static production URL** — [rationale](./docs/decisions.md#mcp-server-endpoint-is-a-static-production-url)
+- **Lore Explorer filters through ONE two-level command menu + pills** — [rationale](./docs/decisions.md#lore-explorer-filters-through-one-two-level-command-menu)
+- **The Explorer's Activity panel has a DISPLAY default (24h), separate from the list's (all time)** — [rationale](./docs/decisions.md#the-explorers-activity-panel-has-a-display-default-separate-from-the-lists)
+- **The Explorer's Activity panel shows ONE body at a time and remembers your disclosure** — [rationale](./docs/decisions.md#the-activity-panel-shows-one-body-at-a-time-and-remembers-your-disclosure)
+- **Chart bucket readouts are PORTALED, one per chart** — [rationale](./docs/decisions.md#chart-bucket-readouts-are-portaled-and-there-is-one-per-chart)
+- **Dashboard figures COUNT to a new value** — [rationale](./docs/decisions.md#dashboard-figures-count-to-a-new-value)
+- **Mobile transient selection surfaces use the `BottomSheet` primitive** — [rationale](./docs/decisions.md#mobile-transient-selection-surfaces-use-the-bottomsheet-primitive)
 - `::` separator avoids collision with `/` in repo paths and `:` in branch names
 - `lk_rw_` prefix encodes permission visibly in config files
-- **Write-only tokens (`lk_wo_*`)** store `permissions: ['write']` in the existing `text[]` column (zero migration); gating logic in the shared pure `permissions.ts`. [rationale](./docs/decisions.md#write-only-tokens-lk_wo_)
+- **Write-only tokens (`lk_wo_*`)** — [rationale](./docs/decisions.md#write-only-tokens-lk_wo_)
 - Token SHA-256 hash in DB — shown once, never stored in plain text
-- **API token scoping (scopes + orgs)** — `api_tokens.scopes` (empty = unrestricted, owner wildcards reuse `expandScopeForSearch`'s grammar, with the trailing `*` legal only after a `/` or a `::`) + a tri-state `org_access`/`org_ids`; the key restriction is authoritative over `org_scope_bindings` auto-routing; scoping is set through an owner-only SECURITY DEFINER RPC, never an UPDATE policy. **Live end to end — 00068 ships the columns and the two predicates, 00069 makes them binding in three layers (transport refusal, query narrowing, and the SQL functions the transports cannot stand in front of), `TokenManager.tsx` sets them, and 00070 audits every change.** [rationale](./docs/decisions.md#api-token-scoping-scopes--orgs)
+- **API token scoping (scopes + orgs)** — [rationale](./docs/decisions.md#api-token-scoping-scopes--orgs)
 - `AlwaysOn` OTel sampler — sampling deferred to Dash0 pipeline, never SDK-side
 - `instrumentation.ts` must be `async function register()` with `NEXT_RUNTIME === 'nodejs'` guard
-- **Browser RUM initialises in `lib/dash0-rum.ts`, identity set at INIT** — every event carries a `user.id` (`anon:<uuid>` until login); never simplify back to a login-only `identify()`. [rationale](./docs/decisions.md#browser-rum-init--identity-at-init)
-- **`OTEL_SERVICE_NAME` must never decide a component's name** — `register()` overwrites it with the code-declared name and warns on conflict. [rationale](./docs/decisions.md#otel_service_name-must-never-decide-a-components-name)
-- **`VERCEL_ENV` must never decide `deployment.environment.name` alone** — always cross-checked against `NODE_ENV` in one shared pure module (`otel-deployment-env.ts`), so a dev server can never report `production`/`preview`; `VERCEL` is deliberately not also gated on. [rationale](./docs/decisions.md#vercel_env-must-never-decide-the-deployment-environment-alone)
-- **Caller identity belongs on the ROOT request span** — `createRouter` sets `auth.type`/`auth.user_id` on the REST root span (as MCP does); enables web↔CLI↔MCP correlation by account, no fingerprinting. [rationale](./docs/decisions.md#caller-identity-belongs-on-the-root-request-span)
-- **CLI telemetry is attributable via a minted install id + a LEARNED account id** — `service.instance.id` (opaque random, persisted to `$LOREKIT_HOME/telemetry-id.json`) plus `user.id` (the account once known, else `install:<id>`, learned from the `X-LoreKit-User-Id` response header and cached, which is what lets an OFFLINE run join to server-side `auth.user_id`). Four invariants are load-bearing: nothing minted and no file created while export is disabled; the account cache only UPDATES an existing file, never creates one; the id is random so deleting the file resets it; an unpersistable id reports as NO identity, never a fresh one per run. Never add an in-memory fallback. [rationale](./docs/decisions.md#cli-telemetry-is-attributable-by-a-locally-minted-install-id-plus-a-learned-account-id)
-- **`hook` and `mcp` are untraced but METERED** — `meterCommand` emits the counter alone (no span) on a 400ms budget, started before the command and awaited after so it overlaps its work; `surface-parity.test.mjs` asserts both that they ARE metered and that they never reach `traceCommand`. [rationale](./docs/decisions.md#hook-and-mcp-are-untraced-but-metered)
-- **The edge's `deployment.environment.name` is set by `deploy.yml`, not inferred** — a Supabase project has no `VERCEL_ENV`, so with the secret unset BOTH projects reported `local` and preview/production traffic was indistinguishable; each deploy job now `supabase secrets set DEPLOYMENT_ENVIRONMENT` (`preview`/`production`) so it self-heals. `preview`, never `staging`. The per-request `test` header still wins for smoke runs. [rationale](./docs/decisions.md#the-edges-deploymentenvironmentname-is-set-by-the-deploy-pipeline-not-inferred)
-- **Edge Function is self-contained Deno** — no cross-package/bare imports; schemas mirrored into `_shared/schemas/`, `npm:` specifiers only; never re-add an import map. [rationale](./docs/decisions.md#edge-function-is-self-contained-deno-no-import-map)
+- **Browser RUM initialises in `lib/dash0-rum.ts`, identity set at INIT** — [rationale](./docs/decisions.md#browser-rum-init--identity-at-init)
+- **`OTEL_SERVICE_NAME` must never decide a component's name** — [rationale](./docs/decisions.md#otel_service_name-must-never-decide-a-components-name)
+- **`VERCEL_ENV` must never decide `deployment.environment.name` alone** — [rationale](./docs/decisions.md#vercel_env-must-never-decide-the-deployment-environment-alone)
+- **Caller identity belongs on the ROOT request span** — [rationale](./docs/decisions.md#caller-identity-belongs-on-the-root-request-span)
+- **CLI telemetry is attributable via a minted install id + a LEARNED account id** — [rationale](./docs/decisions.md#cli-telemetry-is-attributable-by-a-locally-minted-install-id-plus-a-learned-account-id)
+- **`hook` and `mcp` are untraced but METERED** — [rationale](./docs/decisions.md#hook-and-mcp-are-untraced-but-metered)
+- **The edge's `deployment.environment.name` is set by `deploy.yml`, not inferred** — [rationale](./docs/decisions.md#the-edges-deploymentenvironmentname-is-set-by-the-deploy-pipeline-not-inferred)
+- **Edge Function is self-contained Deno** — [rationale](./docs/decisions.md#edge-function-is-self-contained-deno-no-import-map)
 - NX 22.4.0 — matches `gw-tools` exactly; bump both together
-- **Memory cap enforced by a DB trigger** (`NEW.user_id`-keyed, auth-agnostic, unbypassable) — not app-side counting. [rationale](./docs/decisions.md#memory-cap-enforced-by-a-db-trigger)
+- **Memory cap enforced by a DB trigger** — [rationale](./docs/decisions.md#memory-cap-enforced-by-a-db-trigger)
 - Rate limiting is a Postgres-backed fixed-window counter (not in-memory/Redis) — edge isolates are stateless; no new infra
 - Limits config lives in one DB function (`lorekit_default_limit`) + `user_limits` override table — no numeric limit hardcoded; raising a ceiling is one row upsert
-- **Webhook secrets are repo-scoped** — matched by `repository.full_name` against `webhook_secrets.repo`; `selectWebhookSecrets` pure + mirrored. [rationale](./docs/decisions.md#webhook-secrets-are-repo-scoped)
-- **Audit logging is captured at the app layer** — explicit `recordAudit` after each mutation; actor via `auditUserId`; ONE edge writer (`_shared/audit/audit.ts`); one action vocabulary in `@lorekit/schemas`. [rationale](./docs/decisions.md#audit-logging-is-captured-at-the-app-layer)
-- **Usage events recorded once per surface, in the dispatcher** — never per handler; a REST route reports the equivalent MCP tool name via `rest-tool-name.ts`. [rationale](./docs/decisions.md#usage-events-recorded-once-per-surface-in-the-dispatcher)
-- **Org/scope sharing is ORG-FIRST (Phase 1)** — single authoritative shared row; tenant visibility in ONE place (`lorekit_member_org_ids` / `applyTenantScope`). [rationale](./docs/decisions.md#orgscope-sharing-is-org-first-phase-1)
-- **Org-sharing Phase 2 (org-owned writes)** — `memory_write` gains `p_org_slug`, ownership authorization-derived inside the RPC; cap becomes tenant-keyed; `LK002` denial. [rationale](./docs/decisions.md#orgscope-sharing-phase-2-org-owned-writes)
-- **Audit Logs pagination is keyset (cursor), not OFFSET** — opaque `nextCursor`; own `user_id` filter so a forged cursor can't widen visibility. [rationale](./docs/decisions.md#audit-logs-pagination-is-keyset-cursor-not-offset)
-- **Org-sharing Phase 3 (org management backend)** — every state transition is a SECURITY DEFINER RPC; no insert/update/delete RLS; anti-TOCTOU invite accept. [rationale](./docs/decisions.md#orgscope-sharing-phase-3-org-management-backend)
-- **Org-sharing Phase 4 (dashboard UX)** — Settings→Organization page, pure `org-ui.ts` affordances, `ConfirmDialog`/`ToastProvider`; `lorekit_org_members_list` for real identities. [rationale](./docs/decisions.md#orgscope-sharing-phase-4-dashboard-ux)
-- **Safe org deletion** — soft-delete (`deleted_at`) + owner-only `lorekit_org_purge`; hidden from reads via `lorekit_member_org_ids`. [rationale](./docs/decisions.md#safe-org-deletion)
-- **Scope→org binding** — admin binds a scope; a write auto-routes to the org for write-capable members, falls back to personal (never rejected) otherwise. [rationale](./docs/decisions.md#scopeorg-binding) **A binding can also be a WILDCARD prefix** (`repo::owner/*`, `branch::owner/repo::*`, reusing the API-token scope grammar verbatim) — when several bindings match, resolution is most-specific-wins (exact beats any wildcard; longer wildcard prefix beats shorter), gated in SQL by `lorekit_api_token_scopes_valid` on `lorekit_scope_bind`. [rationale](./docs/decisions.md#wildcard-scopeorg-bindings-and-most-specific-wins-precedence)
-- **GitHub App single-secret model** — all App events HMAC-verified against ONE `GITHUB_APP_WEBHOOK_SECRET`; dashboard visibility via `installations/sync`, not the webhook. [rationale](./docs/decisions.md#github-app-single-secret-model)
-- **Comment-relevance classification is server-side, config-driven, and refuses to guess** — the App's webhook path classifies review-thread outcomes (`pull_request_review_thread.resolved` + the merged-PR sweep), not a per-repo GitHub Actions workflow; a directional record requires corroborated evidence and every undecidable branch writes NOTHING (an incomplete commit walk is never "untouched"); the consumer's vocabulary lives in `github_relevance_configs` (literal marker delimiters, never a regex from the DB) and records are written as the installation's OWNER, never `user_id = null`. [rationale](./docs/decisions.md#comment-relevance-classification-is-server-side-config-driven-and-refuses-to-guess)
-- **Hook scope ordering unified, project scope IS injected** — `readOrder` = `[project, branch, repo, global]`, matching the read commands' `scopeList`. [rationale](./docs/decisions.md#hook-scope-ordering-unified-project-scope-injected)
-- **Hook precedence + match is single source of truth with read commands** — `resolvePrecedence`/`matchesQuery` in dependency-free `lessons-pure.mjs`. [rationale](./docs/decisions.md#hook-precedence--match-is-single-source-of-truth-with-read-commands)
-- **CI/CD is split** — `ci.yml` verifies before merge, `deploy.yml` promotes the verified commit (preview→prod); don't re-merge or re-add a deploy-time test job. [rationale](./docs/decisions.md#cicd-is-split-ciyml-verifies-deployyml-promotes)
-- **The deploy SCOPE is measured against what is deployed** — each half is diffed against the SHA it last reached production at (`deployed/api-production`/`deployed/web-production`), never the previous commit; rollbacks repoint the tag, tags fail open, and the decision is the unit-tested `scripts/ci/resolve-deploy-scope.mjs` (called by `deploy.yml`'s `changes` job). Never reinstate the single-push baseline: it let web promote ahead of an API that had never deployed. [rationale](./docs/decisions.md#cicd-is-split-ciyml-verifies-deployyml-promotes)
-- **Smoke tests clean up after themselves + a sweeper** — hard-delete/purge; name-pattern sweep behind four guards; never revert to soft delete / id tracking / a permissive pattern. [rationale](./docs/decisions.md#smoke-tests-clean-up-after-themselves)
-- **Invite-details modal** — SECURITY DEFINER `lorekit_invite_org_details` gated on `lorekit_invite_addressed_to_caller`; Tier-A fields only, never leaks existence. [rationale](./docs/decisions.md#invite-details-modal)
-- **Docs are a PUBLIC MDX section at `/docs`** — single source `DOCS_SECTIONS`; full-text search derived from the same MDX files. [rationale](./docs/decisions.md#docs-are-a-public-mdx-section-at-docs)
-- **Settings sections named for the user's goal** — `/settings/integrations`; sub-nav only when >1 card; manual webhook UI removed (ingest path untouched). [rationale](./docs/decisions.md#settings-sections-named-for-the-users-goal)
-- **Org REST routes open to `lk_*` tokens, gated by token permission not auth tier** — actor via `p_actor_user_id` (service-role only) + explicit tenant reads; CLI dropped MCP entirely. [rationale](./docs/decisions.md#org-rest-routes-open-to-lk_-tokens-gated-by-token-permission)
-- **Org-owned lore archive/hard-delete over REST** — `DELETE /memories?…&org=` routes to the role-gated `memory_delete`; no `/memories/:id`+`org` form; restore has no org branch on either surface. [rationale](./docs/decisions.md#org-owned-lore-archivehard-delete-over-rest)
-- **Usage analytics answer record-level questions** — `GET /memories/usage` reports call AND record counts; two fail-safe headers; expiry event-sourced through the purge. [rationale](./docs/decisions.md#usage-analytics-answer-record-level-questions)
-- **Profiling is SQL-level, because there is no host to profile** — Dash0 profiling needs a host-level eBPF agent and every runtime here is managed serverless; the substitutes are per-request self-time attribution (merged intervals, never summed) and `pg_stat_statements` → cumulative sums through the service-role-only `profiling` function (off until two Vault secrets exist). Don't re-open this as "add the profiler". [rationale](./docs/decisions.md#profiling-is-sql-level-because-there-is-no-host-to-profile)
+- **Webhook secrets are repo-scoped** — [rationale](./docs/decisions.md#webhook-secrets-are-repo-scoped)
+- **Audit logging is captured at the app layer** — [rationale](./docs/decisions.md#audit-logging-is-captured-at-the-app-layer)
+- **Usage events recorded once per surface, in the dispatcher** — [rationale](./docs/decisions.md#usage-events-recorded-once-per-surface-in-the-dispatcher)
+- **Org/scope sharing is ORG-FIRST (Phase 1)** — [rationale](./docs/decisions.md#orgscope-sharing-is-org-first-phase-1)
+- **Org-sharing Phase 2 (org-owned writes)** — [rationale](./docs/decisions.md#orgscope-sharing-phase-2-org-owned-writes)
+- **Audit Logs pagination is keyset (cursor), not OFFSET** — [rationale](./docs/decisions.md#audit-logs-pagination-is-keyset-cursor-not-offset)
+- **Org-sharing Phase 3 (org management backend)** — [rationale](./docs/decisions.md#orgscope-sharing-phase-3-org-management-backend)
+- **Org-sharing Phase 4 (dashboard UX)** — [rationale](./docs/decisions.md#orgscope-sharing-phase-4-dashboard-ux)
+- **Safe org deletion** — [rationale](./docs/decisions.md#safe-org-deletion)
+- **Scope→org binding** — [rationale](./docs/decisions.md#scopeorg-binding)
+- **GitHub App single-secret model** — [rationale](./docs/decisions.md#github-app-single-secret-model)
+- **Comment-relevance classification is server-side, config-driven, and refuses to guess** — [rationale](./docs/decisions.md#comment-relevance-classification-is-server-side-config-driven-and-refuses-to-guess)
+- **Hook scope ordering unified, project scope IS injected** — [rationale](./docs/decisions.md#hook-scope-ordering-unified-project-scope-injected)
+- **Hook precedence + match is single source of truth with read commands** — [rationale](./docs/decisions.md#hook-precedence--match-is-single-source-of-truth-with-read-commands)
+- **CI/CD is split** — [rationale](./docs/decisions.md#cicd-is-split-ciyml-verifies-deployyml-promotes)
+- **The deploy SCOPE is measured against what is deployed** — [rationale](./docs/decisions.md#cicd-is-split-ciyml-verifies-deployyml-promotes)
+- **Smoke tests clean up after themselves + a sweeper** — [rationale](./docs/decisions.md#smoke-tests-clean-up-after-themselves)
+- **Invite-details modal** — [rationale](./docs/decisions.md#invite-details-modal)
+- **Docs are a PUBLIC MDX section at `/docs`** — [rationale](./docs/decisions.md#docs-are-a-public-mdx-section-at-docs)
+- **Settings sections named for the user's goal** — [rationale](./docs/decisions.md#settings-sections-named-for-the-users-goal)
+- **Org REST routes open to `lk_*` tokens, gated by token permission not auth tier** — [rationale](./docs/decisions.md#org-rest-routes-open-to-lk_-tokens-gated-by-token-permission)
+- **Org-owned lore archive/hard-delete over REST** — [rationale](./docs/decisions.md#org-owned-lore-archivehard-delete-over-rest)
+- **Usage analytics answer record-level questions** — [rationale](./docs/decisions.md#usage-analytics-answer-record-level-questions)
+- **Profiling is SQL-level, because there is no host to profile** — [rationale](./docs/decisions.md#profiling-is-sql-level-because-there-is-no-host-to-profile)
 - **The tool catalog is the single origin of the operation SURFACE** — `packages/schemas/src/shared/tool-catalog.ts` declares which of MCP/CLI/REST exposes each op, under what name, and the reason for each absence. Adding an operation? Follow [`docs/adding-an-operation.md`](./docs/adding-an-operation.md) (or `/add-operation`) — it is the step-by-step checklist behind this decision. Consumers *derive* (can import it), *generate* (cannot — `gen-surfaces.mjs`, committed artifacts, `--check`), or *assert* (deriving would be wrong). Never hand-edit a `*.generated.*` file; CLI **behaviour** stays hand-written in `packages/cli/src/commands.mjs`. [tiers + gates](./docs/architecture.md#surface-generation)
 - **`READ_TOOLS`/`WRITE_TOOLS` stay HAND-WRITTEN, not derived from the catalog** — the duplication *is* the authorization control: deriving the gate from the thing it gates means one careless catalog edit silently opens a tool. Held to the catalog by assertion instead (`tool-catalog-parity.spec.ts`), the same way the audit vocabulary is. Do not "simplify" this.
-- **A tool-originated MCP failure is an `isError` result, not a protocol error** — a failure thrown from inside a tool call returns a SUCCESSFUL result with `isError: true` so the model can see it and self-correct; a failure to DISPATCH stays a JSON-RPC error. The line is dispatch, and it maps onto the handler's own try/catch. Auth-family errors stay in-band protocol errors (a 401 or `id: null` hangs mcp-remote) and `-32603` still covers server faults. Wire-contract change: a client testing only `response.error` reads a cap hit as success. [rationale](./docs/decisions.md#a-tool-originated-mcp-failure-is-an-iserror-result-not-a-protocol-error)
-- **MCP `org.*` tools serve `lk_*` tokens, gated by permission not auth tier** — matching REST; `org.list` reads, the three mutations write, and token permission is orthogonal to org ROLE (`lorekit_org_can` in the RPCs is still the only role gate). Actor via `p_actor_user_id`; every raw org read carries its own tenant predicate because the api_key path is service-role. [rationale](./docs/decisions.md#mcp-org-tools-serve-lk_-tokens-on-the-same-actor-override-rest-uses)
-- **Dashboard analytics reads stay REST-only** — `/usage`, `/usage/runs`, `/tags`, `/facets`, `/pivot`, `/activity`, `/read-activity`, `/read-ranking`, `/utility`, `/clusters` get no MCP tool and no CLI command (charts, not agent primitives; most are name-bearing scope-leak surface). Guarded as `restOnly` in `telemetry-vocabulary.ts` (spec pins the TEN by name). `/clusters`/`/utility` have agent-side equivalents that are BETTER (`lorekit dedupe`, `memory.list max_opened_count => 0`); `/relevant` is NOT one of them (`memory.list order=rank` covers it). [rationale](./docs/decisions.md#dashboard-analytics-reads-stay-rest-only)
-- **The Explorer's Duplicate Clusters panel is a PANEL, not an instrument** — near-duplicate grouping is not a `?filters=` dimension (never in `explorer-instruments.ts`/`filters.ts`) and is READ-ONLY (never merges/edits/deletes). Two gates in order: the `lore-explorer-duplicate-clusters` flag (default `off`, copy-and-suffix resolver per render site so `LoreExplorer.tsx` carries no `&&`) decides the surface EXISTS, then the `open` preference (`PREFERENCE_KEYS.explorerClustersOpen`) decides whether it FETCHES. Non-modal LEFT sidebar (flex sibling, never `position:fixed`); selecting a cluster SWAPS the Explorer's own list through the same `LessonCard`, bridged by optimistic cache seeding (`seedOptimisticLesson`). `GET /memories/clusters` ships unflagged. [rationale](./docs/decisions.md#dashboard-analytics-reads-stay-rest-only)
-- **Dashboard analytics live on one dedicated `/insights` route** (unconditional — the gating flag is gone) composing `HealthSummary`/`UsageHealth`/`AgentBreakdown`/`ScopeConsumption`/`LoreUtilityGrid`/`RunsList` led by `LoreCostHeadline`. Explorer (`/lore`) stays the home slot for find/edit and keeps onboarding (`PendingInvitesBanner`/`OnboardingChecklist`/first-token mint); `/insights` is analytics-only. Load-bearing invariants: TWO independent range controls (never one page-wide picker — the shared one is bounded-only `24h`/`7d`/`30d`/`90d`, `ScopeConsumption` keeps its own window); `HealthSummary`/`UsageHealth` EXCLUDE dashboard-originated reads (`excludeDashboardReads`), `AgentBreakdown` keeps them; the verdict is TWO-DIMENSIONAL (`healthVerdict` reliability AND `readCoverage` records-per-read, reporting the WORSE, over record-bearing tools only). [rationale](./docs/decisions.md#dashboard-analytics-live-on-one-dedicated-insights-route)
-- **A COUNT must describe the rows its LIST returns — retention thresholds reach all four readers** — the five conditions (`min_age_days`, `unseen_days`, `max_seen_count`, `max_read_count`, `max_opened_count`) narrow `list`/`_facets`/`_activity`/`_pivot` alike through ONE shared `lorekit_match_retention` (00108; cutoff INSTANTS, applied in the `base` CTE WHERE — never an `ok_*` flag, so it narrows even the self-excluded dimension). `?? null` is never a truthiness check (`max_opened_count => 0` is the point of 00105); all-null params equal omitting them; the Read stat card stays scope-level (`usage_events` can't answer a per-lesson threshold). [rationale](./docs/decisions.md#a-count-must-describe-the-rows-its-list-returns)
-- **A read must never restamp `updated_at`** — `lorekit_record_memory_reads` bumping counters with a plain UPDATE fired the `updated_at` trigger, so a `memory.list` page restamped every row it returned; since `updated_at` is the Explorer/`order=recency` default sort, read activity was driving the order agents received lore in. 00103 suppresses the trigger inside the read-recording function. Read counters move on reads; `updated_at` moves on writes; no column does both. [rationale](./docs/decisions.md#a-read-must-never-restamp-updated_at)
-- **Lore value is the RATIO `opened_count / read_count`, and `/insights` leads with the bill** — absolute counters are supply-side (`seen_count`≈1 for 88% of rows; `read_count` ranks scope breadth), so dividing cancels the confound. 00104 adds `opened_count`; 00106 adds `GET /memories/utility`. FIVE states not four — `load-bearing`/`specialist`/`noise-tax`/`dormant` from two booleans behind an evidence floor (age ≥ 7d AND ≥ 10 deliveries), else `unproven`; a `0` is captioned `counting_since`, never "never". ONE threshold origin (`LESSON_UTILITY_THRESHOLDS` in `@lorekit/schemas`, read by the TS chip AND passed into SQL as params). Two windows: lifetime census on `memories` vs windowed cost on `memory_read_daily`. `HotColdLore` is replaced, but `/read-ranking` and `max_read_count` are NOT deprecated (they answer context COST). [rationale](./docs/decisions.md#lore-value-is-a-ratio-and-insights-leads-with-the-bill)
-- **A citation is the agent's word, and it is a fact about a RUN** — pull-through under-counts SessionStart-injected lore by construction, so 00107 adds `cited: string[]` (`scope::key`) to `memory.write`/`POST /memories`, a `memory_citations` ledger, and `memories.cited_count`/`last_cited_at`. A FIELD, not a `memory.cite` verb (no extra `tools/list` cost). EVIDENCE, never a denominator — voluntary, so `0` = "nothing said so"; no rate/share. The run comes from `X-LoreKit-Correlation-Id`, never the body. Ref grammar is self-contained (`isReferenceScope`, deliberately NOT `validateScope`); failures SILENT, lists truncate at 32, idempotency `(cited, citing, coalesce(correlation_id,''))`. [rationale](./docs/decisions.md#a-citation-is-the-agents-word-and-it-is-a-fact-about-a-run)
-- **`memory.read` batching (`refs: string[]`) is conditional, verbatim-scoped, and inflates a signal it doesn't count** — MCP, `POST /memories/read` and variadic `lorekit show` fetch several `scope::key` in one call. Response shape is CONDITIONAL: singular `scope`+`key` keeps its exact pre-existing shape, `entries`/`missing` appears only under `refs` (every caller needs a shape-dispatch). Batch resolution matches the STORED scope VERBATIM (`groupRefsByScope`, NO `validateScope` normalisation — transports differ in casing), and `parseMemoryRefs` won't fold case-only-different refs. Batching degrades `opened_count` pull-through; the 32-ref cap (shared with `cited`) bounds but doesn't remove it. `readCoverage` isn't comparable across the rollout window — accepted gap. [rationale](./docs/decisions.md#memoryread-batching-is-conditional-verbatim-scoped-and-inflates-a-signal-it-doesnt-count)
-- **An omitted scope on a read means EVERYWHERE, not `global`** — `memory.read`/`memory.list`/`memory.list_archived` and `lorekit show` no longer require a scope; a `global` default would turn a recoverable error into a silent `null` for repo-scoped lore. Read resolves across every visible scope: `memory.read` returns ONE winner by scope-TYPE precedence (`project→branch→repo→global`, the `readOrder` in import-free `scope/scope-precedence.ts`; ties by `updated_at` desc then scope asc — a TOTAL order), the list tools widen. Three copies, guarded by `edge-parity.spec.ts` (byte) + `scope-precedence-parity.spec.ts` (behaviour). A singular read always reports the answering `scope` (+ `other_scopes` when ambiguous); only the winner hits `recordMemoryReads`. REST list routes stay account-wide (unchanged). [rationale](./docs/decisions.md#an-omitted-scope-means-everywhere-not-global)
-- **A tool's `inputSchema` carries NO top-level `oneOf`/`anyOf`/`allOf`** — Amazon Bedrock refuses any such tool and fails the ENTIRE `tools/list` request (it took Agent0 down post-#654). Mutually-exclusive argument shapes go in the tool `description` + handler enforcement; the schema stays permissive. Two gates: `JsonSchemaObject` omits the field (compile error under `satisfies`) and `tool-catalog-parity.spec.ts` asserts no WIRE projection carries any of the three. [rationale](./docs/decisions.md#a-tools-inputschema-carries-no-top-level-oneofanyofallof)
-- **A skill's `metadata.version` must be bumped on any content change, and CI enforces it** — `doctor`/`lorekit update`/the SessionStart drift nudge compare installed vs shipped `SKILL.md` version (a no-op if the stamp never moves — all three skills sat at `1.0.0` through four content PRs). Version-based by design (a human decides whether to nudge; not content-hash, not tied to CLI version). `scripts/ci/skill-version-guard.mjs` is a real `ci.yml` gate over SOURCE `packages/cli/skill/*` only (the plugin mirror is guarded by `sync-plugin-skill.mjs --check`). [rationale](./docs/decisions.md#a-skills-metadataversion-must-be-bumped-on-any-content-change-and-ci-enforces-it)
+- **A tool-originated MCP failure is an `isError` result, not a protocol error** — [rationale](./docs/decisions.md#a-tool-originated-mcp-failure-is-an-iserror-result-not-a-protocol-error)
+- **MCP `org.*` tools serve `lk_*` tokens, gated by permission not auth tier** — [rationale](./docs/decisions.md#mcp-org-tools-serve-lk_-tokens-on-the-same-actor-override-rest-uses)
+- **Dashboard analytics reads stay REST-only** — [rationale](./docs/decisions.md#dashboard-analytics-reads-stay-rest-only)
+- **The Explorer's Duplicate Clusters panel is a PANEL, not an instrument** — [rationale](./docs/decisions.md#dashboard-analytics-reads-stay-rest-only)
+- **Dashboard analytics live on one dedicated `/insights` route** — [rationale](./docs/decisions.md#dashboard-analytics-live-on-one-dedicated-insights-route)
+- **A COUNT must describe the rows its LIST returns — retention thresholds reach all four readers** — [rationale](./docs/decisions.md#a-count-must-describe-the-rows-its-list-returns)
+- **A read must never restamp `updated_at`** — [rationale](./docs/decisions.md#a-read-must-never-restamp-updated_at)
+- **Lore value is the RATIO `opened_count / read_count`, and `/insights` leads with the bill** — [rationale](./docs/decisions.md#lore-value-is-a-ratio-and-insights-leads-with-the-bill)
+- **A citation is the agent's word, and it is a fact about a RUN** — [rationale](./docs/decisions.md#a-citation-is-the-agents-word-and-it-is-a-fact-about-a-run)
+- **`memory.read` batching (`refs: string[]`) is conditional, verbatim-scoped, and inflates a signal it doesn't count** — [rationale](./docs/decisions.md#memoryread-batching-is-conditional-verbatim-scoped-and-inflates-a-signal-it-doesnt-count)
+- **An omitted scope on a read means EVERYWHERE, not `global`** — [rationale](./docs/decisions.md#an-omitted-scope-means-everywhere-not-global)
+- **A tool's `inputSchema` carries NO top-level `oneOf`/`anyOf`/`allOf`** — [rationale](./docs/decisions.md#a-tools-inputschema-carries-no-top-level-oneofanyofallof)
+- **A skill's `metadata.version` must be bumped on any content change, and CI enforces it** — [rationale](./docs/decisions.md#a-skills-metadataversion-must-be-bumped-on-any-content-change-and-ci-enforces-it)

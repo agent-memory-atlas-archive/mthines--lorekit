@@ -23,6 +23,7 @@
 | [storybook.md](./storybook.md) | Developers | Web Storybook: MSW-mocked full-page stories, determinism, and deploying Storybook as a second Vercel project |
 | [releasing.md](./releasing.md) | Developers | Automated `@lorekit/cli` npm releases via release-please + conventional commits |
 | [adding-an-operation.md](./adding-an-operation.md) | Developers | Step-by-step checklist for adding a new MCP tool / CLI command / REST route across the catalog, both permission mirrors, the audit vocabulary, and docs |
+| [sandbox.md](./sandbox.md) | Developers | Fresh sandbox/container baseline — the six traps that make a red gate lie, and how to prove a failure pre-existing (full runbook behind the CLAUDE.md summary) |
 
 ---
 

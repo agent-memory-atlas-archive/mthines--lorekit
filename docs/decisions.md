@@ -748,3 +748,30 @@ directories (`packages/cli/skill/*`) — the Claude-plugin-vendored mirror under
 `plugins/lorekit-claude/skills/*` is already guarded byte-for-byte by
 `scripts/codegen/sync-plugin-skill.mjs --check` (run inside the `plugin` CI job), so the two guards
 compose instead of duplicating each other's job.
+
+## A COUNT must describe the rows its LIST returns
+
+The five retention conditions (`min_age_days`, `unseen_days`, `max_seen_count`, `max_read_count`,
+`max_opened_count`) moved `lorekit_memory_list` from 00092 onward and moved NOTHING else, so
+`max_opened_count => 0` narrowed the Explorer's rows while its facet counts, stat cards and matrix
+kept counting the un-narrowed population — every number on the page describing a different set from
+the one below it.
+
+00108 gives `_facets` / `_activity` / `_pivot` the same five conditions (plus a
+`created_since` / `created_until` pair on facets and pivot; activity's own `since` / `until` already
+bound `created_at`) through **ONE shared `lorekit_match_retention`** rather than a fourth inline copy
+— 00101 records that exact drift happening once already. The helper takes **cutoff INSTANTS, not day
+counts**, which is what keeps it `immutable` and index-usable (each caller resolves its `now()`-relative
+bounds once per query), and it holds 00100's never-opened rule in one place.
+
+It is applied in the `base` CTE's WHERE, **never as an `ok_*` flag**, so a threshold narrows even the
+SELF-EXCLUDED dimension — deliberately unlike a dimension, since self-exclusion exists so the dimension
+you are standing in still lists what you could switch to, and switching `host` does not stop you looking
+at lore older than 30 days. `q` / `key` stay unmirrored (a second `likeNeedle` in plpgsql).
+
+Client-side the mapping is likewise ONE function per layer (`_shared/api/retention.ts`,
+`retentionConditionsToAggregateBody`), and `?? null` is never a truthiness check — `max_opened_count => 0`
+is the whole point of 00105. The **Read** stat card stays scope-level: `usage_events` records a read's
+scope but nothing about the age or counters of the memories it returned, so a per-lesson threshold is
+unanswerable there. §108 pins the narrowing, the self-exclusion interaction, and that all-null params
+equal omitting them.
